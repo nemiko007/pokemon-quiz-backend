@@ -129,8 +129,9 @@ var regionGenerationMap = map[string]int{
 func main() {
 	// .envファイルから環境変数を読み込む（ファイルが存在しなくてもエラーにはならない）
 	err := godotenv.Load()
-	if err != nil {
-		log.Println("Warning: Could not load .env file. Reading environment variables from OS.")
+	// .envファイルが存在しない場合はエラーにしないが、それ以外のエラーはログに出力
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Printf("Error loading .env file: %v", err)
 	}
 
 	jwtKey = []byte(os.Getenv("JWT_SECRET_KEY"))
