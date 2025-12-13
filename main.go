@@ -79,6 +79,8 @@ type pokeAPISpeciesResponse struct {
 type pokeAPIGenerationResponse struct {
 	PokemonSpecies []struct {
 		Name string `json:"name"`
+		// species.URLからIDを抽出するためにURLフィールドを追加
+		URL string `json:"url"`
 	} `json:"pokemon_species"`
 }
 
@@ -509,15 +511,19 @@ func isValidCredentials(cred string) bool {
 // fetchAllPokemonData は、PokeAPIから指定された数のポケモンデータを並行して取得します。
 func fetchAllPokemonData() error {
 	var wg sync.WaitGroup
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: 20 * time.Second} // タイムアウトを少し延長
+
+	// 同時実行数を制限するためのセマフォ
+	// Renderの無料プランなどを考慮し、同時実行数を10に制限
+	semaphore := make(chan struct{}, 10)
 
 	// 1. まず全てのポケモンの基本データを並行取得してマップに格納
 	// PokeAPIの仕様上、IDは1025(Paldea) + α 程度まで存在する
 	const MAX_POKEMON_ID = 1025 // 必要に応じて調整
-	var pokemonTempMap = make(map[int]Pokemon)
 	var mu sync.Mutex
 
 	for i := 1; i <= MAX_POKEMON_ID; i++ {
+		semaphore <- struct{}{} // セマフォを取得
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
@@ -525,9 +531,8 @@ func fetchAllPokemonData() error {
 			// ポケモンの基本情報と種族値を取得
 			pokemonResp, err := client.Get(fmt.Sprintf("https://pokeapi.co/api/v2/pokemon/%d", id))
 			if err != nil {
-				if err, ok := err.(*os.PathError); !ok || !errors.Is(err.Err, os.ErrNotExist) {
-					log.Printf("Error fetching pokemon %d: %v", id, err)
-				}
+				// タイムアウトなどのネットワークエラーをログに出力
+				log.Printf("Error fetching pokemon %d: %v", id, err)
 				return
 			}
 			defer pokemonResp.Body.Close()
@@ -561,12 +566,12 @@ func fetchAllPokemonData() error {
 			// スレッドセーフにリストとマップに追加
 			mu.Lock()
 			pokemonMapByID[pokemon.ID] = pokemon
-			pokemonTempMap[pokemon.ID] = pokemon
 			mu.Unlock()
 
+			<-semaphore // セマフォを解放
 		}(i)
 	}
-	wg.Wait() // 全てのgoroutineが完了するのを待つ
+	wg.Wait()
 
 	// 地方ごとにポケモンを分類する
 	for region, genID := range regionGenerationMap {
@@ -585,19 +590,12 @@ func fetchAllPokemonData() error {
 
 		var regionalPokemonList []Pokemon
 		for _, species := range apiGeneration.PokemonSpecies {
-			urlParts := strings.Split(strings.TrimSuffix(species.Name, "/"), "/")
+			// species.URLからIDを抽出するロジックに修正
+			// 例: "https://pokeapi.co/api/v2/pokemon-species/1/" -> "1"
+			urlParts := strings.Split(strings.TrimSuffix(species.URL, "/"), "/")
 			id, err := strconv.Atoi(urlParts[len(urlParts)-1])
 			if err != nil {
-				// species.NameがIDでない場合（名前の場合）のフォールバック
-				for _, p := range pokemonMapByID {
-					if p.EnglishName == species.Name {
-						id = p.ID
-						break
-					}
-				}
-				if id == 0 {
-					continue
-				}
+				continue // IDが取得できなければスキップ
 			}
 			if p, ok := pokemonMapByID[id]; ok {
 				regionalPokemonList = append(regionalPokemonList, p)
@@ -631,10 +629,21 @@ func buildPokemon(apiPokemon pokeAPIPokemonResponse, apiSpecies pokeAPISpeciesRe
 	}
 
 	var japaneseName string
+	// ja (公式の漢字名) を最優先で探す
 	for _, nameInfo := range apiSpecies.Names {
-		if nameInfo.Language.Name == "ja-Hrkt" { // ひらがな・カタカナの日本語名
+		if nameInfo.Language.Name == "ja" {
 			japaneseName = nameInfo.Name
-			break
+			break // 見つかったらループを抜ける
+		}
+	}
+
+	// ja が見つからなかった場合のみ、ja-Hrkt (ひらがな・カタカナ) を探す
+	if japaneseName == "" {
+		for _, nameInfo := range apiSpecies.Names {
+			if nameInfo.Language.Name == "ja-Hrkt" {
+				japaneseName = nameInfo.Name
+				break
+			}
 		}
 	}
 	if japaneseName == "" {
