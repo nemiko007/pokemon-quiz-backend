@@ -164,7 +164,7 @@ func main() {
 	router.Use(cors.New(cors.Config{
 		// 開発環境のローカルホストと、デプロイ先のNetlifyのURLを許可します。
 		// "https://your-netlify-site-name.netlify.app" の部分は、ご自身のサイトのURLに書き換えてください。
-		AllowOrigins:     []string{"http://localhost:3000", "https://pokequiz-status.netlify.app/"},
+		AllowOrigins:     []string{"http://localhost:3000", "https://pokequiz-status.netlify.app"},
 		AllowMethods:     []string{"GET", "POST"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
 		AllowCredentials: true,
