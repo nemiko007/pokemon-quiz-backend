@@ -527,6 +527,7 @@ func fetchAllPokemonData() error {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
+			defer func() { <-semaphore }() // このゴルーチンが終了する際に必ずセマフォを解放する
 
 			// ポケモンの基本情報と種族値を取得
 			pokemonResp, err := client.Get(fmt.Sprintf("https://pokeapi.co/api/v2/pokemon/%d", id))
@@ -568,7 +569,6 @@ func fetchAllPokemonData() error {
 			pokemonMapByID[pokemon.ID] = pokemon
 			mu.Unlock()
 
-			<-semaphore // セマフォを解放
 		}(i)
 	}
 	wg.Wait()
