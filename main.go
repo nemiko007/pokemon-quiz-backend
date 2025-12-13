@@ -15,12 +15,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gin-contrib/cors" // gin-contrib/corsをインポート
+	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
-	"github.com/glebarez/sqlite" // CGO不要のドライバに変更
+	"github.com/glebarez/sqlite" // CGO不要のドライバをインポート
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/joho/godotenv"
 	"golang.org/x/crypto/bcrypt"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
@@ -132,19 +133,26 @@ const pokemonDataFile = "pokemon.json"
 func main() {
 	// .envファイルから環境変数を読み込む（ファイルが存在しなくてもエラーにはならない）
 	err := godotenv.Load()
-	// .envファイルが存在しない場合はエラーにしないが、それ以外のエラーはログに出力
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		log.Printf("Error loading .env file: %v", err)
 	}
 
 	jwtKey = []byte(os.Getenv("JWT_SECRET_KEY"))
 	if len(jwtKey) == 0 {
-		// JWTキーが設定されていない場合は、安全でないためプログラムを終了する
 		log.Fatal("FATAL: JWT_SECRET_KEY environment variable is not set.")
 	}
 
 	// データベースの初期化
-	db, err = gorm.Open(sqlite.Open("pokemon_quiz.db"), &gorm.Config{})
+	// Render.comなどのPaaSに対応するため、DATABASE_URL環境変数を使用
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		// ローカル開発用にSQLiteにフォールバック
+		log.Println("DATABASE_URL is not set. Falling back to SQLite.")
+		dsn = "pokemon_quiz.db"
+		db, err = gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	} else {
+		db, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	}
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
@@ -159,7 +167,6 @@ func main() {
 	// Ginを本番環境向けに設定
 	gin.SetMode(gin.ReleaseMode)
 
-	// gin.Default()の代わりにgin.New()を使い、ミドルウェアを明示的に指定
 	router := gin.New()
 	router.Use(gin.Logger())   // リクエストログを出力するミドルウェア
 	router.Use(gin.Recovery()) // パニックから回復するミドルウェア
@@ -179,7 +186,6 @@ func main() {
 	}))
 
 	// 信頼するプロキシを設定してセキュリティ警告を解消
-	// ローカル環境ではこれで問題ありません
 	router.SetTrustedProxies([]string{"127.0.0.1"})
 
 	// --- APIエンドポイント ---
