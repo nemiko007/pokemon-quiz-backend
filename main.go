@@ -159,12 +159,15 @@ func main() {
 	router.Use(gin.Logger())   // リクエストログを出力するミドルウェア
 	router.Use(gin.Recovery()) // パニックから回復するミドルウェア
 
+	// 環境変数からフロントエンドのURLを取得
+	frontendURL := os.Getenv("FRONTEND_URL")
+	if frontendURL == "" {
+		frontendURL = "http://localhost:3000" // デフォルトはローカル開発環境
+	}
+
 	// CORS (Cross-Origin Resource Sharing) の設定
-	// Reactアプリ(デフォルトではlocalhost:3000)からのリクエストを許可する
 	router.Use(cors.New(cors.Config{
-		// 開発環境のローカルホストと、デプロイ先のNetlifyのURLを許可します。
-		// "https://your-netlify-site-name.netlify.app" の部分は、ご自身のサイトのURLに書き換えてください。
-		AllowOrigins:     []string{"http://localhost:3000", "https://pokequiz-status.netlify.app"},
+		AllowOrigins:     []string{frontendURL}, // 環境変数から取得したURLを許可
 		AllowMethods:     []string{"GET", "POST"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
 		AllowCredentials: true,
