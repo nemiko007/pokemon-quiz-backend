@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net/http"
@@ -14,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gin-contrib/cors"
+	"github.com/gin-contrib/cors" // gin-contrib/corsをインポート
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite" // CGO不要のドライバに変更
 	"github.com/golang-jwt/jwt/v5"
@@ -126,6 +127,8 @@ var regionGenerationMap = map[string]int{
 	"paldea": 9,
 }
 
+const pokemonDataFile = "pokemon.json"
+
 func main() {
 	// .envファイルから環境変数を読み込む（ファイルが存在しなくてもエラーにはならない）
 	err := godotenv.Load()
@@ -147,13 +150,12 @@ func main() {
 	}
 	db.AutoMigrate(&User{}, &UserStat{}) // テーブルを自動生成
 
-	// サーバー起動時に一度だけ全ポケモンのデータを取得する
-	log.Println("Fetching Pokemon data from PokeAPI...")
-	if err := fetchAllPokemonData(); err != nil {
-		log.Fatalf("Failed to fetch pokemon data: %v", err)
+	// ポケモンデータをファイルから読み込むか、APIから取得する
+	if err := loadOrFetchPokemonData(); err != nil {
+		log.Fatalf("Failed to initialize Pokemon data: %v", err)
 	}
-	log.Printf("Successfully fetched %d Pokemon.", len(pokemonMapByID))
 
+	// --- Ginサーバーの設定 ---
 	// Ginを本番環境向けに設定
 	gin.SetMode(gin.ReleaseMode)
 
@@ -509,6 +511,47 @@ func isValidCredentials(cred string) bool {
 	return hasLetter && hasNumber && isAlphanumeric
 }
 
+// loadOrFetchPokemonData は、pokemon.jsonが存在すればそこからデータを読み込み、
+// 存在しなければPokeAPIから取得してファイルに保存します。
+func loadOrFetchPokemonData() error {
+	if _, err := os.Stat(pokemonDataFile); err == nil {
+		// ファイルが存在する場合
+		log.Println("Loading Pokemon data from", pokemonDataFile)
+		data, err := os.ReadFile(pokemonDataFile)
+		if err != nil {
+			return fmt.Errorf("failed to read pokemon data file: %w", err)
+		}
+		if err := json.Unmarshal(data, &pokemonMapByID); err != nil {
+			return fmt.Errorf("failed to unmarshal pokemon data: %w", err)
+		}
+		log.Printf("Successfully loaded %d Pokemon from file.", len(pokemonMapByID))
+	} else if errors.Is(err, os.ErrNotExist) {
+		// ファイルが存在しない場合
+		log.Println(pokemonDataFile, "not found. Fetching from PokeAPI...")
+		if err := fetchAllPokemonData(); err != nil {
+			return fmt.Errorf("failed to fetch pokemon data: %w", err)
+		}
+
+		// 取得したデータをJSONファイルに保存
+		data, err := json.MarshalIndent(pokemonMapByID, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to marshal pokemon data: %w", err)
+		}
+		if err := os.WriteFile(pokemonDataFile, data, 0644); err != nil {
+			return fmt.Errorf("failed to write pokemon data file: %w", err)
+		}
+		log.Printf("Successfully fetched and saved %d Pokemon to %s", len(pokemonMapByID), pokemonDataFile)
+	} else {
+		// その他のエラー
+		return fmt.Errorf("failed to check pokemon data file: %w", err)
+	}
+
+	// ファイルから読み込んだ後、またはAPIから取得した後に地方別リストを構築
+	buildRegionalLists()
+
+	return nil
+}
+
 // fetchAllPokemonData は、PokeAPIから指定された数のポケモンデータを並行して取得します。
 func fetchAllPokemonData() error {
 	var wg sync.WaitGroup
@@ -538,12 +581,20 @@ func fetchAllPokemonData() error {
 				return
 			}
 			defer pokemonResp.Body.Close()
+
+			// レスポンスボディを一度メモリに読み込む
+			body, err := io.ReadAll(pokemonResp.Body)
+			if err != nil {
+				log.Printf("Error reading pokemon response body %d: %v", id, err)
+				return
+			}
+
 			if pokemonResp.StatusCode == http.StatusNotFound {
 				return // 存在しないIDはスキップ
 			}
 
 			var apiPokemon pokeAPIPokemonResponse
-			if err := json.NewDecoder(pokemonResp.Body).Decode(&apiPokemon); err != nil {
+			if err := json.Unmarshal(body, &apiPokemon); err != nil {
 				log.Printf("Error decoding pokemon %d: %v", id, err)
 				return
 			}
@@ -556,8 +607,14 @@ func fetchAllPokemonData() error {
 			}
 			defer speciesResp.Body.Close()
 
+			body, err = io.ReadAll(speciesResp.Body)
+			if err != nil {
+				log.Printf("Error reading species response body %d: %v", id, err)
+				return
+			}
+
 			var apiSpecies pokeAPISpeciesResponse
-			if err := json.NewDecoder(speciesResp.Body).Decode(&apiSpecies); err != nil {
+			if err := json.Unmarshal(body, &apiSpecies); err != nil {
 				log.Printf("Error decoding species %d: %v", id, err)
 				return
 			}
@@ -574,6 +631,13 @@ func fetchAllPokemonData() error {
 	}
 	wg.Wait()
 
+	// 地方リスト構築のロジックを新しい関数に移動させるため、ここはreturnするだけ
+	return nil
+}
+
+// buildRegionalLists は、pokemonMapByIDから地方ごとのリストを構築します。
+func buildRegionalLists() {
+	client := &http.Client{Timeout: 20 * time.Second}
 	// 地方ごとにポケモンを分類する
 	for region, genID := range regionGenerationMap {
 		resp, err := client.Get(fmt.Sprintf("https://pokeapi.co/api/v2/generation/%d", genID))
@@ -605,8 +669,6 @@ func fetchAllPokemonData() error {
 		pokemonListByRegion[region] = regionalPokemonList
 		log.Printf("Region %s has %d Pokemon.", region, len(regionalPokemonList))
 	}
-
-	return nil
 }
 
 // buildPokemon は、APIレスポンスからPokemon構造体を組み立てます。
