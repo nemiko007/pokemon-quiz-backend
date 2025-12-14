@@ -131,7 +131,14 @@ type UserStat struct {
 	UserID         uint   `gorm:"unique;not null"`
 	TotalQuestions int    `gorm:"default:0"`
 	TotalCorrect   int    `gorm:"default:0"`
-	WrongAnswers   string `gorm:"type:text"` // 間違えたポケモンIDをJSON配列の文字列として保存
+	WrongAnswers   string `gorm:"type:text"`              // 間違えたポケモンIDをJSON配列の文字列として保存
+	RegionalStats  string `gorm:"type:text;default:'{}'"` // 地方ごとの成績をJSONで保存
+}
+
+// 地方ごとの成績詳細
+type RegionalStatDetail struct {
+	Total   int `json:"total"`
+	Correct int `json:"correct"`
 }
 
 // --- グローバル変数と定数 ---
@@ -531,7 +538,20 @@ func handleGetStats(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Stats not found"})
 		return
 	}
-	c.JSON(http.StatusOK, userStat)
+
+	// RegionalStatsをパースして返す
+	var regionalStats map[string]RegionalStatDetail
+	if userStat.RegionalStats != "" && userStat.RegionalStats != "{}" {
+		json.Unmarshal([]byte(userStat.RegionalStats), &regionalStats)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"ID":             userStat.ID,
+		"TotalQuestions": userStat.TotalQuestions,
+		"TotalCorrect":   userStat.TotalCorrect,
+		"WrongAnswers":   userStat.WrongAnswers,
+		"RegionalStats":  regionalStats, // パースした結果を返す
+	})
 }
 
 // --- ミドルウェア ---
@@ -604,6 +624,14 @@ func updateUserStats(db *gorm.DB, userID uint, pokemonID int, isCorrect bool) {
 			}
 		}
 
+		// 地方ごとの成績を更新
+		pokemon, ok := pokemonMapByID[pokemonID]
+		if ok && pokemon.Category != "" {
+			updateRegionalStats(tx, &stat, pokemon.Category, isCorrect)
+		} else {
+			log.Printf("Warning: Could not find category for pokemon ID %d to update regional stats.", pokemonID)
+		}
+
 		if isCorrect {
 			stat.TotalCorrect++
 			// 間違えたリストから削除
@@ -636,6 +664,30 @@ func updateUserStats(db *gorm.DB, userID uint, pokemonID int, isCorrect bool) {
 
 	if err != nil {
 		log.Printf("Failed to update user stats for user %d: %v", userID, err)
+	}
+}
+
+func updateRegionalStats(tx *gorm.DB, stat *UserStat, region string, isCorrect bool) {
+	var regionalStats map[string]RegionalStatDetail
+	if stat.RegionalStats != "" && stat.RegionalStats != "{}" {
+		if err := json.Unmarshal([]byte(stat.RegionalStats), &regionalStats); err != nil {
+			log.Printf("Error unmarshalling regional stats: %v. Initializing new map.", err)
+			regionalStats = make(map[string]RegionalStatDetail)
+		}
+	} else {
+		regionalStats = make(map[string]RegionalStatDetail)
+	}
+
+	regionStat := regionalStats[region]
+	regionStat.Total++
+	if isCorrect {
+		regionStat.Correct++
+	}
+	regionalStats[region] = regionStat
+
+	updatedStats, err := json.Marshal(regionalStats)
+	if err == nil {
+		stat.RegionalStats = string(updatedStats)
 	}
 }
 
