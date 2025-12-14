@@ -1090,6 +1090,15 @@ func buildCategoryLists() {
 	for _, category := range []string{"mega", "gmax", "regional"} {
 		log.Printf("Category %s has %d Pokemon.", category, len(pokemonListByRegion[category]))
 	}
+
+	// 「すべてのポケモン」リストを作成
+	var allPokemonList []Pokemon
+	for _, p := range pokemonMapByID {
+		allPokemonList = append(allPokemonList, p)
+	}
+	pokemonListByRegion["all"] = allPokemonList
+	log.Printf("Category all has %d Pokemon.", len(allPokemonList))
+
 }
 
 // buildPokemon は、APIレスポンスからPokemon構造体を組み立てます。
