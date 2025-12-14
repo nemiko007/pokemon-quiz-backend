@@ -545,6 +545,12 @@ func handleGetStats(c *gin.Context) {
 		json.Unmarshal([]byte(userStat.RegionalStats), &regionalStats)
 	}
 
+	// 過去データからのマイグレーション処理
+	if len(regionalStats) == 0 && userStat.TotalQuestions > 0 {
+		log.Printf("Migrating regional stats for user %d...", userID)
+		regionalStats = migrateRegionalStatsFromWrongAnswers(&userStat)
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"ID":             userStat.ID,
 		"TotalQuestions": userStat.TotalQuestions,
@@ -552,6 +558,41 @@ func handleGetStats(c *gin.Context) {
 		"WrongAnswers":   userStat.WrongAnswers,
 		"RegionalStats":  regionalStats, // パースした結果を返す
 	})
+}
+
+// migrateRegionalStatsFromWrongAnswers は WrongAnswers の情報から地方別成績を復元する
+func migrateRegionalStatsFromWrongAnswers(stat *UserStat) map[string]RegionalStatDetail {
+	regionalStats := make(map[string]RegionalStatDetail)
+	var wrongIDs []int
+	if stat.WrongAnswers != "" && stat.WrongAnswers != "null" {
+		json.Unmarshal([]byte(stat.WrongAnswers), &wrongIDs)
+	}
+	wrongSet := make(map[int]bool)
+	for _, id := range wrongIDs {
+		wrongSet[id] = true
+	}
+
+	// 全ポケモンをループして、正解・不正解を判定し、地方別に集計
+	// この方法はTotalQuestionsと一致しない可能性があるが、近似値として扱う
+	// より正確に行うには、回答履歴をすべてDBに保存する設計変更が必要
+	for id, pokemon := range pokemonMapByID {
+		if pokemon.Category == "" {
+			continue
+		}
+		// このポケモンに回答したことがあると仮定できるか？
+		// 現状のデータだけでは「回答したすべての問題」を知ることができないため、
+		// 「TotalQuestions」から「不正解数」を引いたものを正解数として、各ポケモンに割り振ることは困難。
+		// ここでは、不正解リストにあるポケモンは不正解としてカウントし、
+		// 地方別成績のtotalに加算する。
+		if _, isWrong := wrongSet[id]; isWrong {
+			regionStat := regionalStats[pokemon.Category]
+			regionStat.Total++
+			regionalStats[pokemon.Category] = regionStat
+		}
+	}
+	// TotalCorrect を TotalQuestions と 不正解数から再計算し、地方に割り振るのは複雑なため、
+	// このマイグレーションでは不正解だった問題の地方分布のみを復元する。
+	return regionalStats
 }
 
 // --- ミドルウェア ---
@@ -627,7 +668,7 @@ func updateUserStats(db *gorm.DB, userID uint, pokemonID int, isCorrect bool) {
 		// 地方ごとの成績を更新
 		pokemon, ok := pokemonMapByID[pokemonID]
 		if ok && pokemon.Category != "" {
-			updateRegionalStats(tx, &stat, pokemon.Category, isCorrect)
+			updateRegionalStats(&stat, pokemon.Category, isCorrect)
 		} else {
 			log.Printf("Warning: Could not find category for pokemon ID %d to update regional stats.", pokemonID)
 		}
@@ -667,7 +708,7 @@ func updateUserStats(db *gorm.DB, userID uint, pokemonID int, isCorrect bool) {
 	}
 }
 
-func updateRegionalStats(tx *gorm.DB, stat *UserStat, region string, isCorrect bool) {
+func updateRegionalStats(stat *UserStat, region string, isCorrect bool) {
 	var regionalStats map[string]RegionalStatDetail
 	if stat.RegionalStats != "" && stat.RegionalStats != "{}" {
 		if err := json.Unmarshal([]byte(stat.RegionalStats), &regionalStats); err != nil {
