@@ -31,9 +31,13 @@ import (
 type Pokemon struct {
 	ID          int          `json:"id"`
 	Name        string       `json:"name"` // 日本語名
-	EnglishName string       `json:"-"`    // 英語名 (JSONには含めない)
+	EnglishName string       `json:"englishName"`
+	Category    string       `json:"-"` // "kanto", "mega", "gmax" など (JSONには含めない)
 	Stats       PokemonStats `json:"stats"`
 	ImageURL    string       `json:"imageUrl"`
+	Height      float32      `json:"height"` // m単位
+	Weight      float32      `json:"weight"` // kg単位
+	Types       []string     `json:"types"`  // 日本語のタイプ名
 }
 
 // ポケモンの種族値
@@ -65,10 +69,36 @@ type pokeAPIPokemonResponse struct {
 			} `json:"official-artwork"`
 		} `json:"other"`
 	} `json:"sprites"`
+	Species struct {
+		URL string `json:"url"`
+	} `json:"species"`
+	Height float32 `json:"height"`
+	Weight float32 `json:"weight"`
+	Types  []struct {
+		Type struct {
+			Name string `json:"name"`
+		} `json:"type"`
+	} `json:"types"`
 }
 
 // /pokemon-species/{id} のレスポンス
 type pokeAPISpeciesResponse struct {
+	Names []struct {
+		Language struct {
+			Name string `json:"name"`
+		} `json:"language"`
+		Name string `json:"name"`
+	} `json:"names"`
+	Varieties []struct {
+		IsDefault bool `json:"is_default"`
+		Pokemon   struct {
+			Name string `json:"name"`
+		} `json:"pokemon"`
+	} `json:"varieties"`
+}
+
+// /type/{id} のレスポンス
+type pokeAPITypeResponse struct {
 	Names []struct {
 		Language struct {
 			Name string `json:"name"`
@@ -115,17 +145,23 @@ const TOKEN_DURATION = time.Hour * 24 // トークンの有効期限
 var pokemonListByRegion = make(map[string][]Pokemon)
 var pokemonMapByID = make(map[int]Pokemon) // 全てのポケモンをIDで引けるように保持
 
+// タイプの英語名と日本語名の対応表
+var typeNameMap = make(map[string]string)
+
 // 地方名とPokeAPIの世代IDの対応表
 var regionGenerationMap = map[string]int{
-	"kanto":  1,
-	"johto":  2,
-	"hoenn":  3,
-	"sinnoh": 4,
-	"unova":  5,
-	"kalos":  6,
-	"alola":  7,
-	"galar":  8,
-	"paldea": 9,
+	"kanto":    1,
+	"johto":    2,
+	"hoenn":    3,
+	"sinnoh":   4,
+	"unova":    5,
+	"kalos":    6,
+	"alola":    7,
+	"galar":    8,
+	"paldea":   9,
+	"mega":     -1, // 特殊カテゴリ
+	"gmax":     -2, // 特殊カテゴリ
+	"regional": -3, // 特殊カテゴリ
 }
 
 const pokemonDataFile = "pokemon.json"
@@ -163,6 +199,11 @@ func main() {
 		log.Fatalf("Failed to initialize Pokemon data: %v", err)
 	}
 
+	// タイプ名を初期化
+	if err := loadTypeNames(); err != nil {
+		log.Fatalf("Failed to initialize Pokemon type names: %v", err)
+	}
+
 	// --- Ginサーバーの設定 ---
 	// Ginを本番環境向けに設定
 	gin.SetMode(gin.ReleaseMode)
@@ -195,6 +236,8 @@ func main() {
 	{
 		public.POST("/register", handleRegister)
 		public.POST("/login", handleLogin)
+		public.GET("/quiz", handleGetQuiz)
+		public.POST("/answer", handleAnswer)
 	}
 
 	// 認証が必要なAPIグループ
@@ -203,8 +246,6 @@ func main() {
 	{
 		protected.GET("/me", handleMe)
 		protected.GET("/stats", handleGetStats)
-		protected.GET("/quiz", handleGetQuiz)
-		protected.POST("/answer", handleAnswer)
 	}
 
 	// Renderなどのホスティング環境から提供されるポート番号を取得
@@ -225,8 +266,24 @@ func handleGetQuiz(c *gin.Context) {
 	retry := c.DefaultQuery("retry", "false") == "true"
 
 	// 「間違えた問題」モードの場合
-	if retry {
+	if retry { // このブロックを修正
 		userID, exists := c.Get("userID")
+		if !exists {
+			// ログインしていないユーザーの場合、認証ヘッダーがないので手動でトークンを検証
+			authHeader := c.GetHeader("Authorization")
+			if strings.HasPrefix(authHeader, "Bearer ") {
+				tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+				claims := &jwt.RegisteredClaims{}
+				token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) { return jwtKey, nil })
+				if err == nil && token.Valid {
+					uid, _ := strconv.Atoi(claims.Subject)
+					userID = uint(uid)
+					exists = true
+				}
+			}
+		}
+
+		// トークンが見つからない、または無効な場合はエラー
 		if !exists {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "認証が必要です"})
 			return
@@ -256,8 +313,17 @@ func handleGetQuiz(c *gin.Context) {
 			return
 		}
 
-		// 選択肢はカントー地方のポケモンから生成する（どの地方の問題でも選択肢のプールは同じにする）
-		sendQuiz(c, pokemon, pokemonListByRegion["kanto"])
+		// ポケモンのカテゴリに基づいて選択肢プールを決定
+		optionsPool, ok := pokemonListByRegion[pokemon.Category]
+		if !ok || len(optionsPool) == 0 {
+			// カテゴリが見つからない、または空の場合、フォールバックとして全ポケモンリストを使う
+			log.Printf("Warning: Could not find options pool for category '%s'. Falling back to all Pokemon.", pokemon.Category)
+			optionsPool = make([]Pokemon, 0, len(pokemonMapByID))
+			for _, p := range pokemonMapByID {
+				optionsPool = append(optionsPool, p)
+			}
+		}
+		sendQuiz(c, pokemon, optionsPool)
 		return
 	}
 
@@ -273,21 +339,26 @@ func handleGetQuiz(c *gin.Context) {
 }
 
 func sendQuiz(c *gin.Context, pokemon Pokemon, optionsPool []Pokemon) {
-	options := make([]string, 0, 4)
-	options = append(options, pokemon.Name)
-
-	usedNames := make(map[string]bool)
-	usedNames[pokemon.Name] = true
-
-	for len(options) < 4 && len(optionsPool) > len(options) {
-		distractor := optionsPool[rand.Intn(len(optionsPool))]
-		if !usedNames[distractor.Name] {
-			options = append(options, distractor.Name)
-			usedNames[distractor.Name] = true
+	// 選択肢プールから正解のポケモンを除外した新しいスライスを作成
+	filteredOptionsPool := make([]Pokemon, 0, len(optionsPool)-1)
+	for _, p := range optionsPool {
+		if p.ID != pokemon.ID {
+			filteredOptionsPool = append(filteredOptionsPool, p)
 		}
 	}
 
-	rand.Shuffle(len(options), func(i, j int) {
+	options := make([]string, 0, 4)
+	options = append(options, pokemon.Name)
+
+	// 候補からランダムに3つ選ぶ
+	rand.Shuffle(len(filteredOptionsPool), func(i, j int) {
+		filteredOptionsPool[i], filteredOptionsPool[j] = filteredOptionsPool[j], filteredOptionsPool[i]
+	})
+	for i := 0; i < 3 && i < len(filteredOptionsPool); i++ {
+		options = append(options, filteredOptionsPool[i].Name)
+	}
+
+	rand.Shuffle(len(options), func(i, j int) { // 最終的な選択肢をシャッフル
 		options[i], options[j] = options[j], options[i]
 	})
 
@@ -295,6 +366,9 @@ func sendQuiz(c *gin.Context, pokemon Pokemon, optionsPool []Pokemon) {
 		"id":      pokemon.ID,
 		"stats":   pokemon.Stats,
 		"options": options,
+		"height":  pokemon.Height,
+		"weight":  pokemon.Weight,
+		"types":   pokemon.Types,
 	})
 }
 
@@ -318,6 +392,20 @@ func handleAnswer(c *gin.Context) {
 
 	// 認証済みユーザーの成績を更新
 	userID, exists := c.Get("userID")
+	if !exists {
+		// ログインしていないユーザーの場合、認証ヘッダーがないので手動でトークンを検証
+		authHeader := c.GetHeader("Authorization")
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+			claims := &jwt.RegisteredClaims{}
+			token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) { return jwtKey, nil })
+			if err == nil && token.Valid {
+				uid, _ := strconv.Atoi(claims.Subject)
+				userID = uint(uid)
+				exists = true
+			}
+		}
+	}
 	if exists {
 		updateUserStats(db, userID.(uint), correctPokemon.ID, isCorrect)
 	}
@@ -441,10 +529,19 @@ func authMiddleware() gin.HandlerFunc {
 		claims := &jwt.RegisteredClaims{}
 
 		token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
+			// 署名方式が期待通りか検証
+			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+			}
 			return jwtKey, nil
 		})
 
 		if err != nil || !token.Valid {
+			// エラーの種類によってログレベルを変える
+			if errors.Is(err, jwt.ErrTokenExpired) {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Token has expired"})
+				return
+			}
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
 			return
 		}
@@ -455,7 +552,15 @@ func authMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		c.Set("userID", uint(userID))
+		// トークン内のユーザーIDがDBに実際に存在するか確認
+		var user User
+		if err := db.First(&user, uint(userID)).Error; err != nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "User not found for token"})
+			return
+		}
+
+		// c.Set("userID", user.ID) // user.ID をセットする
+		c.Set("userID", uint(userID)) // 既存のコードとの互換性のため、こちらを維持
 		c.Next()
 	}
 }
@@ -463,46 +568,56 @@ func authMiddleware() gin.HandlerFunc {
 // --- ヘルパー関数 ---
 
 func updateUserStats(db *gorm.DB, userID uint, pokemonID int, isCorrect bool) {
-	var stat UserStat
-	// レコードが存在しない場合に備えてFirstOrCreateを使用
-	if err := db.FirstOrCreate(&stat, UserStat{UserID: userID}).Error; err != nil {
-		return // エラーハンドリング
-	}
+	// トランザクションを開始
+	err := db.Transaction(func(tx *gorm.DB) error {
+		var stat UserStat
+		// レコードをロックして取得し、なければ作成
+		if err := tx.FirstOrCreate(&stat, UserStat{UserID: userID}).Error; err != nil {
+			return err
+		}
 
-	stat.TotalQuestions++
-	var wrongIDs []int
-	if stat.WrongAnswers != "" {
-		json.Unmarshal([]byte(stat.WrongAnswers), &wrongIDs)
-	}
-
-	if isCorrect {
-		stat.TotalCorrect++
-		// 間違えたリストから削除
-		newWrongIDs := []int{}
-		for _, id := range wrongIDs {
-			if id != pokemonID {
-				newWrongIDs = append(newWrongIDs, id)
+		stat.TotalQuestions++
+		var wrongIDs []int
+		if stat.WrongAnswers != "" && stat.WrongAnswers != "null" {
+			if err := json.Unmarshal([]byte(stat.WrongAnswers), &wrongIDs); err != nil {
+				// JSONのパースに失敗した場合、空のスライスとして扱う
+				wrongIDs = []int{}
 			}
 		}
-		wrongIDs = newWrongIDs
-	} else {
-		// 間違えたリストに追加（重複しないように）
-		found := false
-		for _, id := range wrongIDs {
-			if id == pokemonID {
-				found = true
-				break
+
+		if isCorrect {
+			stat.TotalCorrect++
+			// 間違えたリストから削除
+			newWrongIDs := make([]int, 0, len(wrongIDs))
+			for _, id := range wrongIDs {
+				if id != pokemonID {
+					newWrongIDs = append(newWrongIDs, id)
+				}
+			}
+			wrongIDs = newWrongIDs
+		} else {
+			// 間違えたリストに追加（重複しないように）
+			found := false
+			for _, id := range wrongIDs {
+				if id == pokemonID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				wrongIDs = append(wrongIDs, pokemonID)
 			}
 		}
-		if !found {
-			wrongIDs = append(wrongIDs, pokemonID)
-		}
+
+		updatedWrong, _ := json.Marshal(wrongIDs)
+		stat.WrongAnswers = string(updatedWrong)
+
+		return tx.Save(&stat).Error
+	})
+
+	if err != nil {
+		log.Printf("Failed to update user stats for user %d: %v", userID, err)
 	}
-
-	updatedWrong, _ := json.Marshal(wrongIDs)
-	stat.WrongAnswers = string(updatedWrong)
-
-	db.Save(&stat)
 }
 
 // isValidCredentials は、ユーザー名とパスワードが要件を満たしているか検証します。
@@ -531,6 +646,23 @@ func loadOrFetchPokemonData() error {
 			return fmt.Errorf("failed to unmarshal pokemon data: %w", err)
 		}
 		log.Printf("Successfully loaded %d Pokemon from file.", len(pokemonMapByID))
+
+		// 読み込んだデータに不足がないか確認し、あればAPIから再取得する
+		// 最初のポケモンデータで判定
+		if p, ok := pokemonMapByID[1]; ok && (len(p.Types) == 0 || p.Height == 0 || p.Weight == 0) {
+			log.Println("Cached data is incomplete. Refetching all data from PokeAPI...")
+			// マップをクリアして再取得
+			pokemonMapByID = make(map[int]Pokemon)
+			if err := fetchAllPokemonData(); err != nil {
+				return fmt.Errorf("failed to refetch pokemon data: %w", err)
+			}
+			// 新しいデータでファイルを上書き
+			data, err := json.MarshalIndent(pokemonMapByID, "", "  ")
+			if err != nil {
+				return fmt.Errorf("failed to marshal refetched pokemon data: %w", err)
+			}
+			os.WriteFile(pokemonDataFile, data, 0644) // エラーは無視（最悪次回再取得される）
+		}
 	} else if errors.Is(err, os.ErrNotExist) {
 		// ファイルが存在しない場合
 		log.Println(pokemonDataFile, "not found. Fetching from PokeAPI...")
@@ -552,8 +684,11 @@ func loadOrFetchPokemonData() error {
 		return fmt.Errorf("failed to check pokemon data file: %w", err)
 	}
 
-	// ファイルから読み込んだ後、またはAPIから取得した後に地方別リストを構築
-	buildRegionalLists()
+	// 地方別リストがまだ構築されていない場合のみ構築する
+	if len(pokemonListByRegion) == 0 {
+		log.Println("Building category lists...")
+		buildCategoryLists()
+	}
 
 	return nil
 }
@@ -562,6 +697,11 @@ func loadOrFetchPokemonData() error {
 func fetchAllPokemonData() error {
 	var wg sync.WaitGroup
 	client := &http.Client{Timeout: 20 * time.Second} // タイムアウトを少し延長
+
+	// タイプの日本語名を先に読み込む
+	if err := loadTypeNames(); err != nil {
+		return fmt.Errorf("failed to load type names: %w", err)
+	}
 
 	// 同時実行数を制限するためのセマフォ
 	// Renderの無料プランなどを考慮し、同時実行数を10に制限
@@ -631,21 +771,154 @@ func fetchAllPokemonData() error {
 			// スレッドセーフにリストとマップに追加
 			mu.Lock()
 			pokemonMapByID[pokemon.ID] = pokemon
+
+			// 2. フォルム違いを特定して追加
+			for _, variety := range apiSpecies.Varieties {
+				if !variety.IsDefault {
+					vName := variety.Pokemon.Name
+					// wg.Add(1) をゴルーチン起動の前に追加
+					if strings.Contains(vName, "-mega") || strings.Contains(vName, "-mega-x") || strings.Contains(vName, "-mega-y") {
+						wg.Add(1)
+						go fetchAndAddVariety(vName, "mega", &wg, semaphore, &mu)
+					} else if strings.Contains(vName, "-gmax") {
+						wg.Add(1)
+						go fetchAndAddVariety(vName, "gmax", &wg, semaphore, &mu)
+					} else if strings.Contains(vName, "-alola") || strings.Contains(vName, "-galar") || strings.Contains(vName, "-hisui") || strings.Contains(vName, "-paldea") {
+						wg.Add(1)
+						go fetchAndAddVariety(vName, "regional", &wg, semaphore, &mu)
+					}
+				}
+			}
 			mu.Unlock()
 
 		}(i)
 	}
 	wg.Wait()
 
-	// 地方リスト構築のロジックを新しい関数に移動させるため、ここはreturnするだけ
+	return nil // 成功
+}
+
+// fetchAndAddVariety は、フォルム違いのポケモンデータを取得してマップに追加するヘルパー関数です。
+func fetchAndAddVariety(name string, category string, wg *sync.WaitGroup, semaphore chan struct{}, mu *sync.Mutex) {
+	defer wg.Done()
+	semaphore <- struct{}{}
+	defer func() { <-semaphore }()
+
+	client := &http.Client{Timeout: 20 * time.Second}
+
+	// 既にマップに存在するかチェック（重複追加を避ける）
+	mu.Lock()
+	for _, p := range pokemonMapByID {
+		if p.EnglishName == name {
+			mu.Unlock()
+			return
+		}
+	}
+	mu.Unlock()
+
+	// ポケモンの基本情報と種族値を取得
+	pokemonResp, err := client.Get(fmt.Sprintf("https://pokeapi.co/api/v2/pokemon/%s", name))
+	if err != nil {
+		log.Printf("Error fetching variety %s: %v", name, err)
+		return
+	}
+	defer pokemonResp.Body.Close()
+
+	if pokemonResp.StatusCode == http.StatusNotFound {
+		return // 存在しない場合はスキップ
+	}
+
+	var apiPokemon pokeAPIPokemonResponse
+	if err := json.NewDecoder(pokemonResp.Body).Decode(&apiPokemon); err != nil {
+		log.Printf("Error decoding variety %s: %v", name, err)
+		return
+	}
+
+	// ポケモンの日本語名を取得
+	speciesResp, err := client.Get(apiPokemon.Species.URL)
+	if err != nil {
+		log.Printf("Error fetching species for variety %s: %v", name, err)
+		return
+	}
+	defer speciesResp.Body.Close()
+
+	var apiSpecies pokeAPISpeciesResponse
+	if err := json.NewDecoder(speciesResp.Body).Decode(&apiSpecies); err != nil {
+		log.Printf("Error decoding species for variety %s: %v", name, err)
+		return
+	}
+
+	// 必要な情報を抽出
+	pokemon := buildPokemon(apiPokemon, apiSpecies)
+	pokemon.Category = category // カテゴリを上書き
+
+	// スレッドセーフにマップに追加
+	mu.Lock()
+	// IDが重複しないように、10000番台をフォルム違いに割り当てる
+	pokemon.ID += 10000
+	pokemonMapByID[pokemon.ID] = pokemon
+	mu.Unlock()
+}
+
+// loadTypeNames は、PokeAPIからタイプの日本語名を取得してマップに保存します。
+func loadTypeNames() error {
+	if len(typeNameMap) > 0 {
+		return nil // 既に読み込み済み
+	}
+	log.Println("Fetching Pokemon type names...")
+	client := &http.Client{Timeout: 10 * time.Second}
+	// タイプは18種類 + 不明・かげ
+	for i := 1; i <= 18; i++ {
+		resp, err := client.Get(fmt.Sprintf("https://pokeapi.co/api/v2/type/%d", i))
+		if err != nil {
+			return fmt.Errorf("failed to fetch type %d: %w", i, err)
+		}
+		defer resp.Body.Close()
+
+		var typeResp pokeAPITypeResponse
+		if err := json.NewDecoder(resp.Body).Decode(&typeResp); err != nil {
+			return fmt.Errorf("failed to decode type %d: %w", i, err)
+		}
+
+		// 英語のtype名を取得
+		englishTypeName := ""
+		for _, nameInfo := range typeResp.Names {
+			if nameInfo.Language.Name == "en" {
+				englishTypeName = nameInfo.Name
+				break
+			}
+		}
+
+		for _, nameInfo := range typeResp.Names {
+			if nameInfo.Language.Name == "ja-Hrkt" {
+				typeNameMap[englishTypeName] = nameInfo.Name
+			}
+		}
+	}
 	return nil
 }
 
 // buildRegionalLists は、pokemonMapByIDから地方ごとのリストを構築します。
-func buildRegionalLists() {
-	client := &http.Client{Timeout: 20 * time.Second}
-	// 地方ごとにポケモンを分類する
+func buildCategoryLists() {
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	// まず、名前から特殊カテゴリを判定して設定する
+	for id, p := range pokemonMapByID {
+		if strings.Contains(p.EnglishName, "-mega") {
+			p.Category = "mega"
+		} else if strings.Contains(p.EnglishName, "-gmax") {
+			p.Category = "gmax"
+		} else if strings.Contains(p.EnglishName, "-alola") || strings.Contains(p.EnglishName, "-galar") || strings.Contains(p.EnglishName, "-hisui") || strings.Contains(p.EnglishName, "-paldea") {
+			p.Category = "regional"
+		}
+		pokemonMapByID[id] = p
+	}
+
+	// 次に、地方ごとにポケモンを分類する (特殊カテゴリは上書きしない)
 	for region, genID := range regionGenerationMap {
+		if genID <= 0 { // 特殊カテゴリはAPIリクエストをスキップ
+			continue
+		}
 		resp, err := client.Get(fmt.Sprintf("https://pokeapi.co/api/v2/generation/%d", genID))
 		if err != nil {
 			log.Printf("Error fetching generation %s: %v", region, err)
@@ -668,12 +941,23 @@ func buildRegionalLists() {
 			if err != nil {
 				continue // IDが取得できなければスキップ
 			}
-			if p, ok := pokemonMapByID[id]; ok {
+			if p, ok := pokemonMapByID[id]; ok && p.Category == "" { // まだカテゴリが設定されていないポケモンのみ
+				// カテゴリ情報を更新
+				p.Category = region
+				pokemonMapByID[id] = p
 				regionalPokemonList = append(regionalPokemonList, p)
 			}
 		}
 		pokemonListByRegion[region] = regionalPokemonList
 		log.Printf("Region %s has %d Pokemon.", region, len(regionalPokemonList))
+	}
+
+	// 最後に、特殊カテゴリのリストを再構築
+	pokemonListByRegion["mega"] = getPokemonByCategory("mega")
+	pokemonListByRegion["gmax"] = getPokemonByCategory("gmax")
+	pokemonListByRegion["regional"] = getPokemonByCategory("regional")
+	for _, category := range []string{"mega", "gmax", "regional"} {
+		log.Printf("Category %s has %d Pokemon.", category, len(pokemonListByRegion[category]))
 	}
 }
 
@@ -719,11 +1003,34 @@ func buildPokemon(apiPokemon pokeAPIPokemonResponse, apiSpecies pokeAPISpeciesRe
 		japaneseName = apiPokemon.Name // 日本語名がなければ英語名を使う
 	}
 
+	// タイプの日本語名を取得
+	var japaneseTypes []string
+	for _, typeInfo := range apiPokemon.Types {
+		typeID := typeInfo.Type.Name // 英語名でマップを引く
+		if name, ok := typeNameMap[typeID]; ok {
+			japaneseTypes = append(japaneseTypes, name)
+		}
+	}
+
 	return Pokemon{
 		ID:          apiPokemon.ID,
 		Name:        japaneseName,
 		EnglishName: apiPokemon.Name, // 英語名を構造体にセット
 		Stats:       stats,
 		ImageURL:    apiPokemon.Sprites.Other.OfficialArtwork.FrontDefault,
+		Height:      apiPokemon.Height / 10.0, // デシメートルからメートルに変換
+		Weight:      apiPokemon.Weight / 10.0, // ヘクトグラムからキログラムに変換
+		Types:       japaneseTypes,
 	}
+}
+
+// getPokemonByCategory は、指定されたカテゴリのポケモンリストを返します。
+func getPokemonByCategory(category string) []Pokemon {
+	var list []Pokemon
+	for _, p := range pokemonMapByID {
+		if p.Category == category {
+			list = append(list, p)
+		}
+	}
+	return list
 }
