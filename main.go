@@ -652,6 +652,8 @@ func securityHeadersMiddleware() gin.HandlerFunc {
 		c.Header("Content-Security-Policy", "frame-ancestors 'none'")
 		// リファラー情報の制御
 		c.Header("Referrer-Policy", "no-referrer")
+		// キャッシュを無効にする
+		c.Header("Cache-Control", "private, no-store, no-cache, must-revalidate, proxy-revalidate")
 		c.Next()
 	}
 }
