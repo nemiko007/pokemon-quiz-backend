@@ -1,12 +1,12 @@
 package main
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net/http"
 	"os"
 	"regexp"
@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"math/big"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -212,6 +214,9 @@ func main() {
 	router.Use(gin.Logger())   // リクエストログを出力するミドルウェア
 	router.Use(gin.Recovery()) // パニックから回復するミドルウェア
 
+	// セキュリティヘッダーを追加するミドルウェア
+	router.Use(securityHeadersMiddleware())
+
 	// 環境変数からフロントエンドのURLを取得
 	frontendURL := os.Getenv("FRONTEND_URL")
 	if frontendURL == "" {
@@ -305,8 +310,12 @@ func handleGetQuiz(c *gin.Context) {
 		}
 
 		// 間違えた問題リストからランダムに1つ選ぶ
-		rand.Seed(time.Now().UnixNano())
-		targetID := wrongIDs[rand.Intn(len(wrongIDs))]
+		randIndex, err := rand.Int(rand.Reader, big.NewInt(int64(len(wrongIDs))))
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to select a random question"})
+			return
+		}
+		targetID := wrongIDs[randIndex.Int64()]
 		pokemon, ok := pokemonMapByID[targetID]
 		if !ok {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "ポケモンのデータが見つかりません"})
@@ -333,8 +342,12 @@ func handleGetQuiz(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid or empty region specified"})
 		return
 	}
-	rand.Seed(time.Now().UnixNano())
-	randomPokemon := targetPokemonList[rand.Intn(len(targetPokemonList))]
+	randIndex, err := rand.Int(rand.Reader, big.NewInt(int64(len(targetPokemonList))))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to select a random pokemon"})
+		return
+	}
+	randomPokemon := targetPokemonList[randIndex.Int64()]
 	sendQuiz(c, randomPokemon, targetPokemonList)
 }
 
@@ -351,16 +364,22 @@ func sendQuiz(c *gin.Context, pokemon Pokemon, optionsPool []Pokemon) {
 	options = append(options, pokemon.Name)
 
 	// 候補からランダムに3つ選ぶ
-	rand.Shuffle(len(filteredOptionsPool), func(i, j int) {
+	// crypto/randには直接Shuffleがないため、手動でシャッフルします
+	for i := len(filteredOptionsPool) - 1; i > 0; i-- {
+		jBig, _ := rand.Int(rand.Reader, big.NewInt(int64(i+1)))
+		j := jBig.Int64()
 		filteredOptionsPool[i], filteredOptionsPool[j] = filteredOptionsPool[j], filteredOptionsPool[i]
-	})
+	}
 	for i := 0; i < 3 && i < len(filteredOptionsPool); i++ {
 		options = append(options, filteredOptionsPool[i].Name)
 	}
 
-	rand.Shuffle(len(options), func(i, j int) { // 最終的な選択肢をシャッフル
+	// 最終的な選択肢をシャッフル
+	for i := len(options) - 1; i > 0; i-- {
+		jBig, _ := rand.Int(rand.Reader, big.NewInt(int64(i+1)))
+		j := jBig.Int64()
 		options[i], options[j] = options[j], options[i]
-	})
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"id":      pokemon.ID,
@@ -617,6 +636,23 @@ func updateUserStats(db *gorm.DB, userID uint, pokemonID int, isCorrect bool) {
 
 	if err != nil {
 		log.Printf("Failed to update user stats for user %d: %v", userID, err)
+	}
+}
+
+// --- ミドルウェア ---
+
+// securityHeadersMiddleware は、推奨されるセキュリティ関連のHTTPヘッダーをすべてのレスポンスに追加します。
+func securityHeadersMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// クリックジャッキング対策: ページがフレーム内に埋め込まれるのを防ぐ
+		c.Header("X-Frame-Options", "DENY")
+		// MIMEスニッフィング対策
+		c.Header("X-Content-Type-Options", "nosniff")
+		// APIなので、フレームに埋め込まれることを想定しないCSP
+		c.Header("Content-Security-Policy", "frame-ancestors 'none'")
+		// リファラー情報の制御
+		c.Header("Referrer-Policy", "no-referrer")
+		c.Next()
 	}
 }
 
